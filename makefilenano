@@ -4,11 +4,11 @@ all: httpd client
 LIBS = 
 
 httpd: httpd.c
-	gcc -g -W -Wall $(LIBS) -o $@ $<
+    gcc -g -W -Wall $(LIBS) -o $@ $<
 
 client: simpleclient.c
-	gcc -W -Wall -o $@ $<
+    gcc -W -Wall -o $@ $<
 
 # 严谨的清理指令：确保旧的绿色文件被彻底抹除
 clean:
-	rm -f httpd client
+    rm -f httpd client
