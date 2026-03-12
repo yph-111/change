@@ -26,7 +26,7 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <stdint.h>
-
+#include "sds/sds.h"
 #define ISspace(x) isspace((int)(x))
 
 #define SERVER_STRING "Server: jdbhttpd/0.1.0\r\n"
@@ -40,7 +40,7 @@ void cat(int, FILE *);
 void cannot_execute(int);
 void error_die(const char *);
 void execute_cgi(int, const char *, const char *, const char *);
-int get_line(int, char *, int);
+int get_line(int, sds *);
 void headers(int, const char *);
 void not_found(int);
 void serve_file(int, const char *);
@@ -55,8 +55,8 @@ void unimplemented(int);
 void accept_request(void *arg)
 {
     int client = (intptr_t)arg;
-    char buf[1024];
-    size_t numchars;
+    sds buf = sdsempty(); // 初始化为空的 SDS
+ ssize_t numchars;         // get_line 现在返回 int
     char method[255];
     char url[255];
     char path[512];
@@ -66,7 +66,7 @@ void accept_request(void *arg)
                        * program */
     char *query_string = NULL;
 
-    numchars = get_line(client, buf, sizeof(buf));
+    numchars = get_line(client, &buf);
     i = 0; j = 0;
     while (!ISspace(buf[i]) && (i < sizeof(method) - 1))
     {
@@ -86,9 +86,9 @@ void accept_request(void *arg)
         cgi = 1;
 
     i = 0;
-    while (ISspace(buf[j]) && (j < numchars))
+    while (ISspace(buf[j]) && (j < (size_t)numchars))
         j++;
-    while (!ISspace(buf[j]) && (i < sizeof(url) - 1) && (j < numchars))
+    while (!ISspace(buf[j]) && (i < sizeof(url) - 1) && (j < (size_t)numchars))
     {
         url[i] = buf[j];
         i++; j++;
@@ -112,8 +112,10 @@ void accept_request(void *arg)
     if (path[strlen(path) - 1] == '/')
         strcat(path, "index.html");
     if (stat(path, &st) == -1) {
-        while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
-            numchars = get_line(client, buf, sizeof(buf));
+        // SDS 与 strcmp 兼容，所以逻辑不变，只改函数调用
+while ((numchars > 0) && strcmp("\n", buf)) {
+    numchars = get_line(client, &buf);
+}
         not_found(client);
     }
     else
@@ -130,7 +132,8 @@ void accept_request(void *arg)
             execute_cgi(client, path, method, query_string);
     }
 
-    close(client);
+   close(client);
+sdsfree(buf);
 }
 
 /**********************************************************************/
@@ -139,7 +142,7 @@ void accept_request(void *arg)
 /**********************************************************************/
 void bad_request(int client)
 {
-    char buf[1024];
+     sds buf = sdsempty();
 
     sprintf(buf, "HTTP/1.0 400 BAD REQUEST\r\n");
     send(client, buf, sizeof(buf), 0);
@@ -151,6 +154,7 @@ void bad_request(int client)
     send(client, buf, sizeof(buf), 0);
     sprintf(buf, "such as a POST without a Content-Length.\r\n");
     send(client, buf, sizeof(buf), 0);
+sdsfree(buf);
 }
 
 /**********************************************************************/
@@ -162,7 +166,7 @@ void bad_request(int client)
 /**********************************************************************/
 void cat(int client, FILE *resource)
 {
-    char buf[1024];
+    sds buf = sdsempty();
 
     fgets(buf, sizeof(buf), resource);
     while (!feof(resource))
@@ -170,6 +174,7 @@ void cat(int client, FILE *resource)
         send(client, buf, strlen(buf), 0);
         fgets(buf, sizeof(buf), resource);
     }
+sdsfree(buf);
 }
 
 /**********************************************************************/
@@ -178,7 +183,7 @@ void cat(int client, FILE *resource)
 /**********************************************************************/
 void cannot_execute(int client)
 {
-    char buf[1024];
+    sds buf = sdsempty();
 
     sprintf(buf, "HTTP/1.0 500 Internal Server Error\r\n");
     send(client, buf, strlen(buf), 0);
@@ -188,6 +193,7 @@ void cannot_execute(int client)
     send(client, buf, strlen(buf), 0);
     sprintf(buf, "<P>Error prohibited CGI execution.\r\n");
     send(client, buf, strlen(buf), 0);
+sdsfree(buf);
 }
 
 /**********************************************************************/
@@ -210,7 +216,7 @@ void error_die(const char *sc)
 void execute_cgi(int client, const char *path,
         const char *method, const char *query_string)
 {
-    char buf[1024];
+    sds buf = sdsempty();
     int cgi_output[2];
     int cgi_input[2];
     pid_t pid;
@@ -223,16 +229,16 @@ void execute_cgi(int client, const char *path,
     buf[0] = 'A'; buf[1] = '\0';
     if (strcasecmp(method, "GET") == 0)
         while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
-            numchars = get_line(client, buf, sizeof(buf));
+            numchars = get_line(client, &buf);
     else if (strcasecmp(method, "POST") == 0) /*POST*/
     {
-        numchars = get_line(client, buf, sizeof(buf));
+        numchars = get_line(client, &buf);
         while ((numchars > 0) && strcmp("\n", buf))
         {
             buf[15] = '\0';
             if (strcasecmp(buf, "Content-Length:") == 0)
                 content_length = atoi(&(buf[16]));
-            numchars = get_line(client, buf, sizeof(buf));
+            numchars = get_line(client, &buf);
         }
         if (content_length == -1) {
             bad_request(client);
@@ -279,7 +285,7 @@ void execute_cgi(int client, const char *path,
             sprintf(length_env, "CONTENT_LENGTH=%d", content_length);
             putenv(length_env);
         }
-        execl(path, NULL);
+        execl(path, path, (char *)NULL);
         exit(0);
     } else {    /* parent */
         close(cgi_output[1]);
@@ -296,6 +302,7 @@ void execute_cgi(int client, const char *path,
         close(cgi_input[1]);
         waitpid(pid, &status, 0);
     }
+sdsfree(buf);
 }
 
 /**********************************************************************/
@@ -307,47 +314,51 @@ void execute_cgi(int client, const char *path,
  * string will be a linefeed and the string will be terminated with a
  * null character.
  * Parameters: the socket descriptor
- *             the buffer to save the data in
+ *             the bffer to save the data in
  *             the size of the buffer
  * Returns: the number of bytes stored (excluding null) */
 /**********************************************************************/
-int get_line(int sock, char *buf, int size)
-{
-    int i = 0;
-    char c = '\0';
-    int n;
-
-    while ((i < size - 1) && (c != '\n'))
-    {
-        n = recv(sock, &c, 1, 0);
-        /* DEBUG printf("%02X\n", c); */
-        if (n > 0)
-        {
-            if (c == '\r')
-            {
-                n = recv(sock, &c, 1, MSG_PEEK);
-                /* DEBUG printf("%02X\n", c); */
-                if ((n > 0) && (c == '\n'))
-                    recv(sock, &c, 1, 0);
-                else
-                    c = '\n';
-            }
-            buf[i] = c;
-            i++;
-        }
-        else
-            c = '\n';
-    }
-    buf[i] = '\0';
-
-    return(i);
-}
 
 /**********************************************************************/
 /* Return the informational HTTP headers about a file. */
 /* Parameters: the socket to print the headers on
  *             the name of the file */
-/**********************************************************************/
+/*******************/
+int get_line(int sock, sds *out_sds) {
+    int i = 0;
+    char c = '\0';
+    int n;
+
+    // 1. 初始化 SDS：如果传入的是空指针，先分配内存
+    if (*out_sds == NULL) {
+        *out_sds = sdsempty();
+    } else {
+        sdsclear(*out_sds); // 如果已有内容，先清空
+    }
+
+    // 2. 核心循环：读取字符直至换行符
+    while (c != '\n') {
+        n = recv(sock, &c, 1, 0);
+        if (n > 0) {
+            if (c == '\r') {
+                n = recv(sock, &c, 1, MSG_PEEK);
+                if ((n > 0) && (c == '\n'))
+                    recv(sock, &c, 1, 0);
+                else
+                    c = '\n';
+            }
+            // 核心替换：不再使用 buf[i] = c
+            // 而是使用 sdscatlen 动态追加，自动处理扩容
+            *out_sds = sdscatlen(*out_sds, &c, 1);
+            i++;
+        } else {
+            c = '\n';
+        }
+    }
+    
+    // SDS 内部自带 '\0'，不需要像原版那样手动添加 buf[i] = '\0'
+    return i; 
+}
 void headers(int client, const char *filename)
 {
     char buf[1024];
@@ -401,11 +412,11 @@ void serve_file(int client, const char *filename)
 {
     FILE *resource = NULL;
     int numchars = 1;
-    char buf[1024];
+    sds buf = sdsempty();
 
     buf[0] = 'A'; buf[1] = '\0';
     while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
-        numchars = get_line(client, buf, sizeof(buf));
+        numchars = get_line(client, &buf);
 
     resource = fopen(filename, "r");
     if (resource == NULL)
@@ -416,6 +427,7 @@ void serve_file(int client, const char *filename)
         cat(client, resource);
     }
     fclose(resource);
+sdsfree(buf);
 }
 
 /**********************************************************************/
