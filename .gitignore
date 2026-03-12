@@ -1,0 +1,32 @@
+# ========== 只屏蔽编译产物/临时文件，保留所有核心源码 ==========
+# SDS 编译产物（保留 sds.c/sds.h 等源码）
+sds/sds-test
+sds/*.o
+
+# Tinyhttpd 编译产物（保留 httpd.c/Makefile 等源码）
+httpd
+simpleclient
+*.o
+
+# C-Thread-Pool 只屏蔽产物，保留 threadpool.c/threadpool.h 等源码
+C-Thread-Pool/*.o
+C-Thread-Pool/example
+C-Thread-Pool/*.out
+
+# 通用临时文件
+*.swp
+*.swo
+.DS_Store# 线程池实验目录（不提交）
+C-Thread-Pool/
+
+# SDS 编译产物
+sds/sds-test
+
+# Tinyhttpd 编译产物
+httpd
+simpleclient
+*.o
+
+# 临时文件
+*.swp
+*.swo
