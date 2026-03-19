@@ -3,8 +3,8 @@ all: httpd client
 
 LIBS = -lpthread
 
-httpd: httpd.c
-	gcc -g -W -Wall $(LIBS) -o $@ $<
+httpd: httpd.c sds.c thpool.c
+	gcc -g -W -Wall -o httpd httpd.c sds.c thpool.c $(LIBS)
 
 client: simpleclient.c
 	gcc -W -Wall -o $@ $<

@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include "sds/sds.h"
+#include "thpool.h"
+#include <signal.h>
 #define ISspace(x) isspace((int)(x))
 
 #define SERVER_STRING "Server: jdbhttpd/0.1.0\r\n"
@@ -54,7 +56,9 @@ void unimplemented(int);
 /**********************************************************************/
 void accept_request(void *arg)
 {
-    int client = (intptr_t)arg;
+    //int client = (intptr_t)arg;
+int client = *(int *)arg;  // 从内存地址里取出真正的 socket 号
+free(arg);                 // 释放 main 函数里 malloc 的内存
     sds buf = sdsempty(); // 初始化为空的 SDS
  ssize_t numchars;         // get_line 现在返回 int
     char method[255];
@@ -500,29 +504,38 @@ void unimplemented(int client)
 
 int main(void)
 {
+signal(SIGPIPE, SIG_IGN);
     int server_sock = -1;
     u_short port = 4000;
     int client_sock = -1;
     struct sockaddr_in client_name;
     socklen_t  client_name_len = sizeof(client_name);
-    pthread_t newthread;
 
     server_sock = startup(&port);
     printf("httpd running on port %d\n", port);
-
+threadpool thpool = thpool_init(8);
     while (1)
     {
         client_sock = accept(server_sock,
                 (struct sockaddr *)&client_name,
                 &client_name_len);
-        if (client_sock == -1)
-            error_die("accept");
-        /* accept_request(&client_sock); */
-        if (pthread_create(&newthread , NULL, (void *)accept_request, (void *)(intptr_t)client_sock) != 0)
-            perror("pthread_create");
+if (client_sock == -1) {
+            // 不要用 error_die 让整个服务器结束进程
+            perror("accept failed");
+            continue; // 忽略这个错误连接，继续循环等下一个
+        }
+        //if (client_sock == -1)
+           // error_die("accept");
+        // accept_request(&client_sock); 
+        //if (pthread_create(&newthread , NULL, (void *)accept_request, (void *)(intptr_t)client_sock) != 0)
+          
+int *arg = (int *)malloc(sizeof(int));
+        *arg = client_sock;
+        thpool_add_work(thpool, (void (*)(void *))accept_request, (void *)arg);
     }
 
     close(server_sock);
 
     return(0);
 }
+
