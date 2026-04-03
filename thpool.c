@@ -192,20 +192,29 @@ struct thpool_* thpool_init(int num_threads){
 
 
 /* Add work to the thread pool */
+// 【生产者对外网关接口】
+// 这是主线程（生产者）将外部 socket 连接投递给线程池的唯一入口，负责将离散的函数和参数打包成标准任务节点。
 int thpool_add_work(thpool_* thpool_p, void (*function_p)(void*), void* arg_p){
 	job* newjob;
-
+        // 必须通过 malloc 在堆区动态开辟任务节点。因为此函数极快执行完毕后就会弹栈，
+        // 若使用局部栈变量，Worker 线程还没来得及取任务，内存就已经失效，会导致致命的段错误。
 	newjob=(struct job*)malloc(sizeof(struct job));
+        // 极限高并发压测下，系统可用内存可能被瞬间耗尽（Out of Memory）。
+        // 此处严格拦截内存分配失败，防止后续空指针解引用导致整个 Web 服务器闪退。
 	if (newjob==NULL){
 		err("thpool_add_work(): Could not allocate memory for new job\n");
 		return -1;
 	}
 
 	/* add function and argument */
+        // 利用 C 语言的函数指针机制，将特定业务逻辑（如 accept_request）及其参数地址
+        // 无缝挂载到抽象的 job 结构体上，实现了框架层与业务层的彻底解耦。
 	newjob->function=function_p;
 	newjob->arg=arg_p;
 
 	/* add job to queue */
+        // 复杂的互斥锁 (Mutex) 竞争、多线程链表指针安全插入、以及对 Worker 线程的重新启用
+        // 被封装在了内部的 push 函数中，极大降低了外层 API 调用的负担。
 	jobqueue_push(&thpool_p->jobqueue, newjob);
 
 	return 0;
@@ -342,6 +351,10 @@ static void* thread_do(struct thread* thread_p){
 
 #if defined(__linux__)
 	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */
+// 【可观测性设计】
+        // 调用内核 prctl 接口重命名子线程。
+        // 这样在 Linux 系统下执行 top -H 或 htop 时，可以直接看到每个 Worker 线程的名称而非通用的进程名，
+        // 极大地方便了高并发环境下的 CPU 性能调优和死锁追踪。
 	prctl(PR_SET_NAME, thread_name);
 #elif defined(__APPLE__) && defined(__MACH__)
 	pthread_setname_np(thread_name);
@@ -359,6 +372,9 @@ static void* thread_do(struct thread* thread_p){
 	sigemptyset(&act.sa_mask);
 	act.sa_flags = SA_ONSTACK;
 	act.sa_handler = thread_hold;
+// 【线程运行时控制】
+        // 为子线程注册 SIGUSR1 信号。这允许主线程通过信号交互手段（如 thread_hold），
+        // 在不销毁线程的情况下暂时挂起某个 Worker，实现了对线程池状态的动态精细化控制。
 	if (sigaction(SIGUSR1, &act, NULL) == -1) {
 		err("thread_do(): cannot handle SIGUSR1");
 	}
@@ -367,9 +383,15 @@ static void* thread_do(struct thread* thread_p){
 	pthread_mutex_lock(&thpool_p->thcount_lock);
 	thpool_p->num_threads_alive += 1;
 	pthread_mutex_unlock(&thpool_p->thcount_lock);
-
+// 【消除创建开销】
+        // 线程池的核心：利用死循环维持线程生命。
+        // 通过这种方式，Worker 线程在处理完一个 HTTP 请求后不会退出，而是循环等待下一个任务。
+        // 这规避了原生 TinyHTTPd 频繁调用 pthread_create 所产生的内核态上下文切换负载。
 	while(threads_keepalive){
-
+// 【非忙等待】
+                // 任务队列为空时，线程会在此处触发信号量等待并交出 CPU 执行权。
+                // 此时线程处于“休眠态”，直到生产者投递新任务并发送唤醒信号。
+                // 这种机制确保了服务器在空闲时 CPU 占用率接近 0%。
 		bsem_wait(thpool_p->jobqueue.has_jobs);
 
 		if (threads_keepalive){
@@ -381,11 +403,21 @@ static void* thread_do(struct thread* thread_p){
 			/* Read job from queue and execute it */
 			void (*func_buff)(void*);
 			void*  arg_buff;
+// 【临界区保护】
+                        // 唤醒后立即尝试从链表中提取任务节点。
+                        // 函数内部封装了互斥锁操作，确保在多个 Worker 同时被唤醒时，
+                        // 只有一个线程能抢到任务指针。
 			job* job_p = jobqueue_pull(&thpool_p->jobqueue);
 			if (job_p) {
 				func_buff = job_p->function;
 				arg_buff  = job_p->arg;
+				// 【执行具体业务】
+                                // 解构出回调函数地址及其参数，正式切入 Web 服务器逻辑（如 accept_request）。
+                                // 此时线程池框架仅作为载体，具体的协议解析和文件传输在这一行被触发。
 				func_buff(arg_buff);
+			// 【释放任务载体】
+                                // 任务执行完毕，立即释放堆区的 job 结构体内存。
+                                // 配合 httpd.c 里的内存管理，形成了从任务创建到销毁的完整闭环。
 				free(job_p);
 			}
 
@@ -454,13 +486,18 @@ static void jobqueue_clear(jobqueue* jobqueue_p){
 /* Add (allocated) job to queue
  */
 static void jobqueue_push(jobqueue* jobqueue_p, struct job* newjob){
-
+// 【互斥锁竞争】
+        // 必须通过原子操作申请互斥锁（Mutex）。如果此时有 Worker 线程正在队列中取任务，
+        // 主线程将在此处阻塞等待，严格防止多个线程同时修改链表指针导致内存写冲突。
 	pthread_mutex_lock(&jobqueue_p->rwmutex);
 	newjob->prev = NULL;
-
+// 【双向链表边界处理】
+        // 依据当前队列长度进行分支处理。线程池的任务调度本质上是一个“先进先出”模型。
+        // 通过维护 front 和 rear 指针，实现了在 O(1) 时间复杂度内完成任务的快速入队和出队。
 	switch(jobqueue_p->len){
 
 		case 0:  /* if no jobs in queue */
+// 针对空队列的特殊初始化：将新任务同时置为队首和队尾。
 					jobqueue_p->front = newjob;
 					jobqueue_p->rear  = newjob;
 					break;
@@ -470,9 +507,16 @@ static void jobqueue_push(jobqueue* jobqueue_p, struct job* newjob){
 					jobqueue_p->rear = newjob;
 
 	}
+// 【计数器原子更新】
+        // 在互斥锁的保护下安全地自增任务计数。这个数字是监控线程池负载、判断系统满载状态的核心指标。
 	jobqueue_p->len++;
-
+// 【条件唤醒信号】
+        // 任务入队成功后，通过信号量发出唤醒指令。
+        // 此时，操作系统内核会将一个原本处于休眠挂起态的 Worker 线程精准地切换回就绪态，
+        // 触发其从“阻塞等待”变为“取出执行”。
 	bsem_post(jobqueue_p->has_jobs);
+// 【锁的归还】
+        // 临界区操作完成，主动释放互斥锁。只有这一步执行完，由于竞争而被挂起的其他线程才有机会继续执行。
 	pthread_mutex_unlock(&jobqueue_p->rwmutex);
 }
 
