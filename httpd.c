@@ -56,9 +56,17 @@ void unimplemented(int);
 /**********************************************************************/
 void accept_request(void *arg)
 {
-    //int client = (intptr_t)arg;
+    // 这里是消费者端。之前在 main 函数里，为了防止多线程并发时抢夺同一个局部变量的 fd，
+    // 用 malloc 给每个请求分配了独立堆内存。
+    // 这里拿到真正的 socket 号后，第一件事就是赶紧 free 掉
+    // 不然压测跑几万个并发，内存不出十分钟就会彻底爆掉。
 int client = *(int *)arg;  // 从内存地址里取出真正的 socket 号
 free(arg);                 // 释放 main 函数里 malloc 的内存
+// 【底层安全改造：引入 SDS 防溢出】
+    // 原版 TinyHTTPd 在这里搞了个 char buf[1024]，一旦攻击者发个 2000 字节的恶意 URL，
+    // 整个服务器直接段错误崩溃。
+    // 这里换成 Redis 的 sds（简单动态字符串），初始化为空。
+    // 后续底层读取时如果超长，sds 内部会自动扩容（realloc），从根本上免疫了缓冲区的溢出攻击。
     sds buf = sdsempty(); // 初始化为空的 SDS
  ssize_t numchars;         // get_line 现在返回 int
     char method[255];
@@ -69,34 +77,41 @@ free(arg);                 // 释放 main 函数里 malloc 的内存
     int cgi = 0;      /* becomes true if server decides this is a CGI
                        * program */
     char *query_string = NULL;
-
+// 获取 HTTP 请求的第一行（Request Line），传入 buf 的地址让其在内部动态扩容
     numchars = get_line(client, &buf);
     i = 0; j = 0;
+// HTTP 协议解析：请求方法
+    // 好处：sds 的内部结构确保了它的指针直接指向字符串数据的开头，
+    // 所以这里无需改动原版逻辑，直接把 buf 当作普通数组用下标遍历即可，无缝兼容。
     while (!ISspace(buf[i]) && (i < sizeof(method) - 1))
     {
+// 将合法的方法字符逐一拷贝入局部栈内存中
         method[i] = buf[i];
         i++;
     }
+// 同步 j 游标，记录当前解析到的报文偏移量，为后续提取 URL 保存状态
     j=i;
     method[i] = '\0';
-
+// 利用忽略大小写的字符串比对，拦截除 GET 和 POST 以外的不合法或不支持的请求方法
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
     {
         unimplemented(client);
         return;
     }
-
+// HTTP 协议规范约束：POST 请求用于提交实体数据，强制触发动态 CGI 脚本处理逻辑
     if (strcasecmp(method, "POST") == 0)
         cgi = 1;
 
     i = 0;
     while (ISspace(buf[j]) && (j < (size_t)numchars))
         j++;
+// 开始提取 URL，开启双重安全防护：既不越过 url 栈数组上限，也不越过实际报文长度
     while (!ISspace(buf[j]) && (i < sizeof(url) - 1) && (j < (size_t)numchars))
     {
         url[i] = buf[j];
         i++; j++;
     }
+// 同样执行手动封口，截断 URL 字符串
     url[i] = '\0';
 
     if (strcasecmp(method, "GET") == 0)
@@ -106,7 +121,9 @@ free(arg);                 // 释放 main 函数里 malloc 的内存
             query_string++;
         if (*query_string == '?')
         {
+// 只要带参数，说明请求的是动态计算接口，强行置起 CGI 标志
             cgi = 1;
+// 【核心算法：原位切割】将 '?' 强行替换为 '\0'，将一块连续内存瞬间截断为两半
             *query_string = '\0';
             query_string++;
         }
@@ -117,7 +134,12 @@ free(arg);                 // 释放 main 函数里 malloc 的内存
         strcat(path, "index.html");
     if (stat(path, &st) == -1) {
         // SDS 与 strcmp 兼容，所以逻辑不变，只改函数调用
+// 【网络排错踩坑点：清空接收缓冲区】
+        // 如果文件不存在（404）， 不会close socket 直接结束。
+        // 客户端可能还在继续发 HTTP 头，如果直接关连接，客户端会收到 TCP RST 错误。
+        // 所以这里利用改写后的 get_line 配合 sds，把剩下的协议头空读一遍，保证连接能稳定断开。
 while ((numchars > 0) && strcmp("\n", buf)) {
+// 必须读完残留报文，否则单方面 close socket 会导致客户端触发 TCP RST (连接被重置) 异常
     numchars = get_line(client, &buf);
 }
         not_found(client);
@@ -126,6 +148,8 @@ while ((numchars > 0) && strcmp("\n", buf)) {
     {
         if ((st.st_mode & S_IFMT) == S_IFDIR)
             strcat(path, "/index.html");
+// 【核心路由判断】利用位掩码 (Bitmask) 嗅探该文件的权限属性
+        // 只要文件所有者、所在组或其他人具有可执行权限 (x)
         if ((st.st_mode & S_IXUSR) ||
                 (st.st_mode & S_IXGRP) ||
                 (st.st_mode & S_IXOTH)    )
@@ -137,6 +161,10 @@ while ((numchars > 0) && strcmp("\n", buf)) {
     }
 
    close(client);
+// 【内存管理：闭环回收 2】
+    // Worker 线程准备处理下一个任务了，上一个就不能留存没用的东西。
+    // SDS 的内存在堆上，使用完毕必须调用 sdsfree 彻底销毁，
+    // 配合开头的 free(arg)，实现了常驻线程在高并发冲击下极强的稳定性
 sdsfree(buf);
 }
 
@@ -329,7 +357,10 @@ sdsfree(buf);
  *             the name of the file */
 /*******************/
 int get_line(int sock, sds *out_sds) {
-    int i = 0;
+// 传入 sds 的二级指针 (*out_sds)。
+    // 因为内部触发扩容(realloc)时，如果在原地无法扩展，系统会在堆区开辟新内存并将数据迁移，
+    // 原指针地址会失效。通过二级指针才能将更新后的内存地址同步回传给调用方。
+int i = 0;
     char c = '\0';
     int n;
 
@@ -337,6 +368,8 @@ int get_line(int sock, sds *out_sds) {
     if (*out_sds == NULL) {
         *out_sds = sdsempty();
     } else {
+        // 如果 sds 已经分配过内存，sdsclear 只是将头部的 len 属性置为 0，
+        // 并不真正 free 底层空间。这样极大减少了高并发长连接下频繁系统调用的开销。
         sdsclear(*out_sds); // 如果已有内容，先清空
     }
 
@@ -345,6 +378,8 @@ int get_line(int sock, sds *out_sds) {
         n = recv(sock, &c, 1, 0);
         if (n > 0) {
             if (c == '\r') {
+// 网络协议嗅探：使用 MSG_PEEK 标志位“偷看” TCP 接收缓冲区中的下一个字符，
+                // 确认是不是 \n，且不会把该字符从缓冲区中真正消耗掉，以此兼容各种操作系统的换行符。
                 n = recv(sock, &c, 1, MSG_PEEK);
                 if ((n > 0) && (c == '\n'))
                     recv(sock, &c, 1, 0);
@@ -353,6 +388,9 @@ int get_line(int sock, sds *out_sds) {
             }
             // 核心替换：不再使用 buf[i] = c
             // 而是使用 sdscatlen 动态追加，自动处理扩容
+// 废弃原版 buf[i] = c 的危险指针偏移操作。
+            // sdscatlen 内部以 O(1) 复杂度校验剩余容量，空间不足时会依据 sdsMakeRoomFor 算法自动扩容。
+            // 这一步从根本上免疫了黑客发送超长恶意的 HTTP Header 导致的栈溢出 (Stack Overflow) 攻击。
             *out_sds = sdscatlen(*out_sds, &c, 1);
             i++;
         } else {
@@ -361,6 +399,8 @@ int get_line(int sock, sds *out_sds) {
     }
     
     // SDS 内部自带 '\0'，不需要像原版那样手动添加 buf[i] = '\0'
+// 二进制安全与向下兼容：SDS 每次追加数据后，内部会自动在有效数据末尾维护一个 '\0'，
+    // 因此无需像原版那样手动封口，且能完美兼容后续调用的 strcasecmp 等标准 C 库函数。
     return i; 
 }
 void headers(int client, const char *filename)
@@ -504,6 +544,10 @@ void unimplemented(int client)
 
 int main(void)
 {
+    // 忽略 SIGPIPE 信号。
+    // 压测的时候发现，如果并发太高客户端突然断开连接，
+    // 服务器继续往 socket 写数据会触发 SIGPIPE 导致整个进程默默退出。
+    // 加上这行能防止单个异常连接拖垮整个服务器。
 signal(SIGPIPE, SIG_IGN);
     int server_sock = -1;
     u_short port = 4000;
@@ -513,22 +557,28 @@ signal(SIGPIPE, SIG_IGN);
 
     server_sock = startup(&port);
     printf("httpd running on port %d\n", port);
+// 初始化 8 个线程的线程池
+    // 之前原版是来一个请求就 pthread_create 一次，1000 并发压测时直接死机了。
+    // 改用线程池可以复用线程，减少上下文切换开销，还能起到限流的作用。
 threadpool thpool = thpool_init(8);
     while (1)
     {
         client_sock = accept(server_sock,
                 (struct sockaddr *)&client_name,
                 &client_name_len);
+// 把原来的 error_die 换成了 perror + continue
+        // 压测时如果瞬间并发太多（比如超出了 ulimit 文件描述符限制），accept 可能会失败。
+        // 这时候不能让服务器直接退出，打印错误后继续等下一个请求就行。
 if (client_sock == -1) {
             // 不要用 error_die 让整个服务器结束进程
             perror("accept failed");
             continue; // 忽略这个错误连接，继续循环等下一个
         }
-        //if (client_sock == -1)
-           // error_die("accept");
-        // accept_request(&client_sock); 
-        //if (pthread_create(&newthread , NULL, (void *)accept_request, (void *)(intptr_t)client_sock) != 0)
-          
+// 这里必须用 malloc 动态分配内存来传参
+        // 因为 while 循环跑得极快，如果直接传 &client_sock 的地址，
+        // 线程池还没来得及处理，client_sock 的值可能就被下一次 accept 的新连接覆盖了。
+        // 这会导致多个线程串行处理同一个 fd。用 malloc 隔离内存就能解决这个问题。
+        // (对应的 free 内存释放操作放在了 accept_request 函数的末尾)
 int *arg = (int *)malloc(sizeof(int));
         *arg = client_sock;
         thpool_add_work(thpool, (void (*)(void *))accept_request, (void *)arg);
