@@ -138,14 +138,17 @@ static void  bsem_wait(struct bsem *bsem_p);
 
 /* Initialise thread pool */
 struct thpool_* thpool_init(int num_threads){
-
+// 【全局状态机初始化】
+        // keepalive 设为 1 表示线程池处于运行态。
+        // 所有的工作线程在 thread_do 循环中都会持续监听这个标志位，以决定是否继续存活
 	threads_on_hold   = 0;
 	threads_keepalive = 1;
 
 	if (num_threads < 0){
 		num_threads = 0;
 	}
-
+        // 【主控结构体内存分配】
+        // 在堆区为线程池（thpool_p）申请内存
 	/* Make new thread pool */
 	thpool_* thpool_p;
 	thpool_p = (struct thpool_*)malloc(sizeof(struct thpool_));
@@ -155,10 +158,14 @@ struct thpool_* thpool_init(int num_threads){
 	}
 	thpool_p->num_threads_alive   = 0;
 	thpool_p->num_threads_working = 0;
-
+        // 【任务队列初始化】
+        // 队列是生产者（主线程）和消费者（工作线程）交互的唯一缓冲区。
+        // jobqueue_init 内部会初始化用于队列互斥访问的锁和用于阻塞挂起的信号
 	/* Initialise the job queue */
 	if (jobqueue_init(&thpool_p->jobqueue) == -1){
 		err("thpool_init(): Could not allocate memory for job queue\n");
+	// 【级联回滚】
+                // 发生异常时必须回滚之前已分配的主控结构体内存，防止内存泄漏
 		free(thpool_p);
 		return NULL;
 	}
@@ -171,11 +178,15 @@ struct thpool_* thpool_init(int num_threads){
 		free(thpool_p);
 		return NULL;
 	}
-
+// 【同步原语初始化】
+        // thcount_lock: 用于保护 num_threads_alive 和 working 这两个统计变量的互斥锁。
+        // threads_all_idle: 条件变量，当所有线程都处于空闲状态时，可用来唤醒等待销毁的主线程
 	pthread_mutex_init(&(thpool_p->thcount_lock), NULL);
 	pthread_cond_init(&thpool_p->threads_all_idle, NULL);
 
 	/* Thread init */
+// 【内核线程派生】
+        // 依次实例化每一个工作线程。thread_init 内部会真正执行 pthread_create 陷入内核态
 	int n;
 	for (n=0; n<num_threads; n++){
 		thread_init(thpool_p, &thpool_p->threads[n], n);
@@ -185,6 +196,10 @@ struct thpool_* thpool_init(int num_threads){
 	}
 
 	/* Wait for threads to initialize */
+// 【自旋等待】
+        // 极其关键的一步。主线程在此处通过死循环轻量级阻塞，直到所有的子线程
+        // 都成功在自己的执行流中将 num_threads_alive 自增到 num_threads。
+        // 这确保了线程池对象返回给调用者时，所有的 Worker 都已 100% 准备就绪，避免了时序竞态条件
 	while (thpool_p->num_threads_alive != num_threads) {}
 
 	return thpool_p;
@@ -235,10 +250,14 @@ void thpool_wait(thpool_* thpool_p){
 void thpool_destroy(thpool_* thpool_p){
 	/* No need to destroy if it's NULL */
 	if (thpool_p == NULL) return ;
-
+// 使用 volatile 关键字修饰，强制每次从内存中读取该变量，
+        // 防止编译器优化导致在多核多线程环境下读到 CPU 寄存器里的旧缓存值
 	volatile int threads_total = thpool_p->num_threads_alive;
 
 	/* End each thread 's infinite loop */
+// 将全局运行标志位清零。
+        // 此时，所有在 thread_do 中执行的 while循环，
+        // 在下一次条件判断时都将判定为假，从而跳出死循环，准备退出
 	threads_keepalive = 0;
 
 	/* Give one second to kill idle threads */
@@ -247,6 +266,8 @@ void thpool_destroy(thpool_* thpool_p){
 	double tpassed = 0.0;
 	time (&start);
 	while (tpassed < TIMEOUT && thpool_p->num_threads_alive){
+// 持续释放信号量，强制唤醒所有阻塞的空闲线程。
+                // 它们醒来后会检查到 keepalive == 0，从而主动结束运行
 		bsem_post_all(thpool_p->jobqueue.has_jobs);
 		time (&end);
 		tpassed = difftime(end,start);
@@ -260,6 +281,7 @@ void thpool_destroy(thpool_* thpool_p){
 
 	/* Job queue cleanup */
 	jobqueue_destroy(&thpool_p->jobqueue);
+// 严格按照与 init 初始化相反的顺序（自底向上）进行 free 操作
 	/* Deallocs */
 	int n;
 	for (n=0; n < threads_total; n++){
@@ -308,17 +330,25 @@ int thpool_num_threads_working(thpool_* thpool_p){
  * @return 0 on success, -1 otherwise.
  */
 static int thread_init (thpool_* thpool_p, struct thread** thread_p, int id){
-
+// 【元数据存储】
+        // 在堆区申请一块内存，用于存放单个线程的属性
+        // 这块内存是纯用户态的，用于构建我们的“面向对象”线程管理模型
 	*thread_p = (struct thread*)malloc(sizeof(struct thread));
 	if (*thread_p == NULL){
 		err("thread_init(): Could not allocate memory for thread\n");
 		return -1;
 	}
-
+// 将全局线程池指针绑定到该子线程上。
+        // 这至关重要，因为子线程在执行 thread_do 时，必须通过这个指针去访问
+        // 全局共享的 jobqueue以及互斥锁和信号量
 	(*thread_p)->thpool_p = thpool_p;
 	(*thread_p)->id       = id;
 
 	pthread_create(&(*thread_p)->pthread, NULL, (void * (*)(void *)) thread_do, (*thread_p));
+        // 默认情况下，线程是“可连接的”，其终止后内核仍会保留部分数据结构，直到其他线程调用 pthread_join。
+        // 调用 pthread_detach 后，该线程与主线程“脱钩”。
+        // 当它执行完毕（即跳出 thread_do 死循环）退出时，操作系统会自动且立刻回收其占用的所有内核资源。
+        // 这避免了主线程必须时刻阻塞等待子线程结束的劣势，实现了真正的异步管理
 	pthread_detach((*thread_p)->pthread);
 	return 0;
 }
