@@ -257,13 +257,18 @@ void execute_cgi(int client, const char *path,
     char c;
     int numchars = 1;
     int content_length = -1;
-
+// 【第一阶段：HTTP 头部解析与状态维护】
+    // 根据请求方法的不同，采取不同的头部处理策略。
     buf[0] = 'A'; buf[1] = '\0';
     if (strcasecmp(method, "GET") == 0)
+// 对于 GET 请求，参数已通过 URL 传递
+        // 故在此处读取并丢弃所有剩余的 HTTP Header，清空缓冲区，防止干扰后续请求。
         while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
             numchars = get_line(client, &buf);
     else if (strcasecmp(method, "POST") == 0) /*POST*/
     {
+// 对于 POST 请求，必须解析出 "Content-Length" 字段。
+        // 这决定了后续我们需要从客户端套接字中读取多少字节的数据投递给 CGI 程序。
         numchars = get_line(client, &buf);
         while ((numchars > 0) && strcmp("\n", buf))
         {
@@ -272,6 +277,7 @@ void execute_cgi(int client, const char *path,
                 content_length = atoi(&(buf[16]));
             numchars = get_line(client, &buf);
         }
+// 【协议安全检测】如果 POST 请求未包含长度字段，则视为不合规请求，返回 400 错误。
         if (content_length == -1) {
             bad_request(client);
             return;
@@ -281,7 +287,8 @@ void execute_cgi(int client, const char *path,
     {
     }
 
-
+// 【第二阶段：IPC 进程间通信环境搭建】
+    // 建立两个单向管道。每个管道都有一个读端 [0] 和一个写端 [1]
     if (pipe(cgi_output) < 0) {
         cannot_execute(client);
         return;
@@ -290,11 +297,12 @@ void execute_cgi(int client, const char *path,
         cannot_execute(client);
         return;
     }
-
-    if ( (pid = fork()) < 0 ) {
-        cannot_execute(client);
-        return;
+// 【第三阶段：进程克隆 (Forking)】
+    // 调用 fork() 创建子进程。这是 Linux 并发模型的精髓：
+    // 父子进程将共享同一份代码，但拥有独立的内存栈空间
+    if ( (pid = fork()) < 0 ) { cannot_execute(client); return;
     }
+// 先回传 HTTP 200 状态行给客户端，告知请求已被受理，准备进入动态处理阶段
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
     send(client, buf, strlen(buf), 0);
     if (pid == 0)  /* child: CGI script */
@@ -302,7 +310,9 @@ void execute_cgi(int client, const char *path,
         char meth_env[255];
         char query_env[255];
         char length_env[255];
-
+// 【标准流重定向】
+        // 利用 dup2 将管道的写端重定向到系统的 STDOUT（1），读端重定向到 STDIN（0）
+        // 这样做的好处是：CGI 程序只需使用简单的 printf 或 scanf，数据就能自动流向管道
         dup2(cgi_output[1], STDOUT);
         dup2(cgi_input[0], STDIN);
         close(cgi_output[0]);
@@ -320,6 +330,7 @@ void execute_cgi(int client, const char *path,
         execl(path, path, (char *)NULL);
         exit(0);
     } else {    /* parent */
+// 关闭不需要的管道端点，遵循“最小权限原则”，防止死锁
         close(cgi_output[1]);
         close(cgi_input[0]);
         if (strcasecmp(method, "POST") == 0)
@@ -327,6 +338,9 @@ void execute_cgi(int client, const char *path,
                 recv(client, &c, 1, 0);
                 write(cgi_input[1], &c, 1);
             }
+// 【数据反馈：解析结果回传】
+        // 父进程从管道 cgi_output[0] 中循环读取子进程的输出，
+        // 并将其原样// 【数据反馈：解析结果回传】
         while (read(cgi_output[0], &c, 1) > 0)
             send(client, &c, 1, 0);
 
@@ -457,20 +471,31 @@ void serve_file(int client, const char *filename)
     FILE *resource = NULL;
     int numchars = 1;
     sds buf = sdsempty();
-
+// 【第一阶段：协议栈清理】
+    // 即使我们现在处理的是静态文件，不需要读取额外的 HTTP 请求头（如 User-Agent, Cookie 等），
+    // 但根据 HTTP 协议和 TCP 传输特性，我们必须将客户端发送过来的后续所有头部信息全部读取并丢弃。
+    // 如果不这样做，TCP 缓冲区中残留的数据会干扰下一次 HTTP 请求的解析，导致“协议粘包”现象。
     buf[0] = 'A'; buf[1] = '\0';
     while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
         numchars = get_line(client, &buf);
-
+// 调用封装好的 get_line 函数。由于传入了 sds 的地址，
+        // get_line 内部会自动根据行长度进行动态扩容，从而支持超长 Header 的安全读取// 【第二阶段：文件系统交互与异常处理】
+    // 以只读模式（"r"）打开目标文件。
+    // 这是从“虚拟 URL”映射到“物理磁盘路径”后的关键执行点
     resource = fopen(filename, "r");
     if (resource == NULL)
         not_found(client);
     else
     {
+// 【第三阶段：HTTP 协议握手与内容投递】
+        //  发送 HTTP 响应头（200 OK）
+        // 在正式发送文件内容之前，必须先回传协议规定的响应起始行和元数据
         headers(client, filename);
         cat(client, resource);
     }
     fclose(resource);
+// 【SDS 资源释放】
+    // 必须手动调用 sdsfree 销毁之前申请的动态字符串内存
 sdsfree(buf);
 }
 
@@ -484,30 +509,51 @@ sdsfree(buf);
 /**********************************************************************/
 int startup(u_short *port)
 {
-    int httpd = 0;
-    int on = 1;
+    int httpd = 0;// 服务器监听套接字的文件描述符
+    int on = 1;// 用于 setsockopt 的开关标志位
     struct sockaddr_in name;
-
+// 【第一阶段：创建协议栈接入点】
+    // PF_INET: 使用 IPv4 互联网协议族
+    // SOCK_STREAM: 申请面向连接的流式传输服务（即 TCP 协议）
+    // 0: 让系统根据前两个参数自动选择默认协议（即 IPPROTO_TCP）
     httpd = socket(PF_INET, SOCK_STREAM, 0);
     if (httpd == -1)
         error_die("socket");
+// 【第二阶段：配置服务地址信息】
+    // 将地址结构体清零，防止内存残留数据干扰后续 bind 操作
     memset(&name, 0, sizeof(name));
     name.sin_family = AF_INET;
+// 【字节序转换：Endianness Handling】
+    // htons (Host to Network Short): 将主机的字节序（通常是小端序）转换为
+    // 网络传输标准的“大端序”。这是保证不同 CPU 架构机器之间能正常解析端口号的关键
     name.sin_port = htons(*port);
+// 【绑定策略：INADDR_ANY】
+    // htonl(INADDR_ANY) 代表监听当前机器上所有的网卡接口（0.0.0.0）。
+    // 无论请求是从 127.0.0.1 还是局域网 IP 进来，只要端口匹配，服务器均予以响应
     name.sin_addr.s_addr = htonl(INADDR_ANY);
+// 【端口快速复用】
+    // SO_REUSEADDR 标志位极其重要：服务器在异常关闭并重新启动时，
+    // 强制跳过 TCP 的 TIME_WAIT 状态
+    // 避免出现 "Address already in use" 报错
     if ((setsockopt(httpd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0)  
     {  
         error_die("setsockopt failed");
     }
     if (bind(httpd, (struct sockaddr *)&name, sizeof(name)) < 0)
         error_die("bind");
+// 【动态端口协商机制】
+    // 如果调用者传入的端口号为 0，说明请求操作系统自动分配一个随机空闲端口
     if (*port == 0)  /* if dynamically allocating a port */
     {
         socklen_t namelen = sizeof(name);
         if (getsockname(httpd, (struct sockaddr *)&name, &namelen) == -1)
             error_die("getsockname");
+// 将网络字节序的端口号转换回主机字节序，并更新指针回传给调用方
         *port = ntohs(name.sin_port);
     }
+// 【第四阶段：开启监听（Listen）】
+    // 参数 5 代表 Backlog 队列（积压队列）的长度。
+    // 定义了在内核还没来得及调用 accept 提取请求前，TCP 三次握手已完成的最大并发连接数。
     if (listen(httpd, 5) < 0)
         error_die("listen");
     return(httpd);
