@@ -12,6 +12,7 @@
  *  4) Uncomment the line that runs accept_request().
  *  5) Remove -lsocket from the Makefile.
  */
+#include "logger.h"
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -76,7 +77,19 @@ free(arg);                 // 释放 main 函数里 malloc 的内存
     struct stat st;
     int cgi = 0;      /* becomes true if server decides this is a CGI
                        * program */
+    /* becomes true if server decides this is a CGI
+                       * program */
     char *query_string = NULL;
+
+    // ==========================================
+    // 在这里加入日志！带上 client socket 编号
+    LOG_I("接收到新的客户端请求 (Socket: %d)，开始解析...", client);
+    // ==========================================
+
+// 获取 HTTP 请求的第一行（Request Line），传入 buf 的地址让其在内部动态扩容
+LOG_I("接收到新的客户端请求，开始解析...");
+    numchars = get_line(client, &buf);
+    i = 0; j = 0;
 // 获取 HTTP 请求的第一行（Request Line），传入 buf 的地址让其在内部动态扩容
     numchars = get_line(client, &buf);
     i = 0; j = 0;
@@ -600,9 +613,13 @@ signal(SIGPIPE, SIG_IGN);
     int client_sock = -1;
     struct sockaddr_in client_name;
     socklen_t  client_name_len = sizeof(client_name);
-
+if (log_init("server.log") != 0) {
+    printf("日志初始化失败\n");
+}
+LOG_I("Tinyhttpd 服务器启动，准备监听端口...");
     server_sock = startup(&port);
-    printf("httpd running on port %d\n", port);
+LOG_I("httpd running on port %d", port);
+    //printf("httpd running on port %d\n", port);
 // 初始化 8 个线程的线程池
     // 之前原版是来一个请求就 pthread_create 一次，1000 并发压测时直接死机了。
     // 改用线程池可以复用线程，减少上下文切换开销，还能起到限流的作用。
@@ -631,7 +648,7 @@ int *arg = (int *)malloc(sizeof(int));
     }
 
     close(server_sock);
-
+log_close();
     return(0);
 }
 
