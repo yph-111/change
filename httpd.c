@@ -36,7 +36,8 @@
 #define STDIN   0
 #define STDOUT  1
 #define STDERR  2
-
+int total_requests_count = 0;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 void accept_request(void *);
 void bad_request(int);
 void cat(int, FILE *);
@@ -84,6 +85,11 @@ free(arg);                 // 释放 main 函数里 malloc 的内存
     // ==========================================
     // 在这里加入日志！带上 client socket 编号
     LOG_I("接收到新的客户端请求 (Socket: %d)，开始解析...", client);
+// 安全地累加总请求数
+    pthread_mutex_lock(&stats_mutex);
+    total_requests_count++;
+    int current_count = total_requests_count; // 存入局部变量，准备传给网页
+    pthread_mutex_unlock(&stats_mutex);
     // ==========================================
 
 // 获取 HTTP 请求的第一行（Request Line），传入 buf 的地址让其在内部动态扩容
@@ -91,8 +97,6 @@ LOG_I("接收到新的客户端请求，开始解析...");
     numchars = get_line(client, &buf);
     i = 0; j = 0;
 // 获取 HTTP 请求的第一行（Request Line），传入 buf 的地址让其在内部动态扩容
-    numchars = get_line(client, &buf);
-    i = 0; j = 0;
 // HTTP 协议解析：请求方法
     // 好处：sds 的内部结构确保了它的指针直接指向字符串数据的开头，
     // 所以这里无需改动原版逻辑，直接把 buf 当作普通数组用下标遍历即可，无缝兼容。
@@ -105,6 +109,7 @@ LOG_I("接收到新的客户端请求，开始解析...");
 // 同步 j 游标，记录当前解析到的报文偏移量，为后续提取 URL 保存状态
     j=i;
     method[i] = '\0';
+printf("【DEBUG探针】get_line读取了 %d 字节，提取出的 method 是: [%s]\n", numchars, method);
 // 利用忽略大小写的字符串比对，拦截除 GET 和 POST 以外的不合法或不支持的请求方法
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
     {
@@ -126,7 +131,30 @@ LOG_I("接收到新的客户端请求，开始解析...");
     }
 // 同样执行手动封口，截断 URL 字符串
     url[i] = '\0';
-
+// ================= 扩展功能：实时状态面板 =================
+    if (strcasecmp(url, "/status") == 0) {
+        LOG_I("向客户端下发实时状态监控面板");
+        char response[1024];
+        sprintf(response, 
+            "HTTP/1.0 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "\r\n"
+            "<html><head><title>Server Status</title></head>"
+            "<body style='font-family: Arial; padding: 20px;'>"
+            "<h2>🚀 Tinyhttpd 实时状态监控面板</h2><hr>"
+            "<ul>"
+            "<li><b>系统状态：</b> 🟢 运行中</li>"
+            "<li><b>底层架构：</b> 线程池 + SDS动态字符串</li>"
+            "<li><b>并发总处理请求数：</b> <span style='color:red; font-size:18px;'>%d</span> 次</li>"
+            "<li><b>日志系统：</b> 已接入 (物理文件 server.log)</li>"
+            "</ul>"
+            "</body></html>", current_count);
+        
+        send(client, response, strlen(response), 0);
+        close(client);
+        return; // 拦截完毕，直接返回，不再执行后续查找物理文件的逻辑
+    }
+    // ==========================================================
     if (strcasecmp(method, "GET") == 0)
     {
         query_string = url;
