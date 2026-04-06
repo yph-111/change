@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::thread;
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4000").unwrap();
     println!("🚀 Rust 版 Tinyhttpd 已启动，监听端口: 4000");
@@ -9,16 +10,24 @@ fn main() {
 
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
+// 【多线程进化】在把计数器扔进新线程之前，先给它配一把“备用钥匙”
+        let counter_clone = Arc::clone(&request_count);
+
+        // 【多线程进化】使用 spawn 开启新线程，使用 move 把流和钥匙的所有权转移进去
+        thread::spawn(move || {
         let mut buffer = [0; 1024];
 
         stream.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..]);
 let request_line = request.lines().next().unwrap_or("");
-        println!("【收到请求】: {}", request.lines().next().unwrap_or(""));
+// 拿到当前的线程 ID，方便我们在终端里看是不是真的多线程了
+            let thread_id = thread::current().id();
+            println!("【线程 {:?} 收到请求】: {}", thread_id, request_line);
+        //println!("【收到请求】: {}", request.lines().next().unwrap_or(""));
 
        // 注意：这里不需要手动写 unlock！当 count 变量离开作用域时，Rust 会自动解锁。
         let current_count = {
-            let mut count = request_count.lock().unwrap();
+            let mut count = counter_clone.lock().unwrap();
             *count += 1;
             *count // 返回当前最新的值
         };
@@ -73,5 +82,6 @@ let request_line = request.lines().next().unwrap_or("");
 
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
-    }
+    });
+  }
 }
