@@ -69,6 +69,86 @@ let request_line = request.lines().next().unwrap_or("");
 
             ("200 OK", "text/html", html)
 
+// 【新增】云端极客笔记本 Pro 版路由
+        } else if method == "GET" && path == "/notebook" {
+            let html = format!(r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>NPU 云端极客笔记本 - Pro版</title>
+                
+                //<link rel="stylesheet" href="https://cdn.jsdelivr.net/simplemde/latest/simplemde.min.css">
+                //<script src="https://cdn.jsdelivr.net/simplemde/latest/simplemde.min.js"></script>
+                //<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+                //<script src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+                //<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/vs2015.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/simplemde/latest/simplemde.min.css">
+    <script src="https://cdn.jsdelivr.net/simplemde/latest/simplemde.min.js"></script>
+    
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; margin: 0; padding: 0; }}
+                    .header {{ background: #2c3e50; color: white; padding: 15px 20px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+                    .container {{ max-width: 1200px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 8px 16px rgba(0,0,0,0.1); height: 80vh; display: flex; flex-direction: column; }}
+                    .visitor-badge {{ background: #e74c3c; color: white; padding: 4px 10px; border-radius: 12px; font-size: 14px; margin-left: 10px; vertical-align: middle; }}
+                    .btn-download {{ display: block; width: 100%; background: #27ae60; color: white; border: none; padding: 15px; font-size: 18px; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 15px; transition: 0.3s; }}
+                    .btn-download:hover {{ background: #2ecc71; }}
+                    .CodeMirror {{ flex-grow: 1; font-size: 16px; }} 
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h2>📝 NPU 云端极客笔记 (Pro 版) <span class="visitor-badge">并发处理请求: {} 次</span></h2>
+                </div>
+                <div class="container">
+                    <textarea id="my_editor"></textarea>
+                    <button class="btn-download" onclick="downloadNote()"><i class="fa fa-download"></i> 💾 封存笔记并下载到本机 (.md)</button>
+                </div>
+                
+                <script>
+                    var simplemde = new SimpleMDE({{
+                        element: document.getElementById("my_editor"),
+                        spellChecker: false,
+                        autofocus: true,
+                        // 开启本地自动保存黑科技
+                        autosave: {{
+                            enabled: true,
+                            uniqueId: "NpuGeekNote",
+                            delay: 1000,
+                        }},
+                        // 开启代码语法高亮
+                        renderingConfig: {{
+                            codeSyntaxHighlighting: true
+                        }}
+                    }});
+                    
+                    // 强制开启左右分屏模式
+      //              simplemde.toggleSideBySide();
+                    
+                    // 触发本地下载的魔法函数
+                    function downloadNote() {{
+                        var text = simplemde.value();
+                        if (!text) {{ alert("哎呀，你连字都还没敲呢！"); return; }}
+                        
+                        var blob = new Blob([text], {{ type: "text/markdown;charset=utf-8" }});
+                        var link = document.createElement("a");
+                        link.href = URL.createObjectURL(blob);
+                        link.download = "NPU_极客笔记_机密文件.md";
+                        
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                    }}
+                </script>
+            </body>
+            </html>
+            "#, current_count);
+            
+            ("200 OK", "text/html", html)
         } else if method == "GET" && path == "/" {
             ("200 OK", "text/plain", format!("欢迎来到根目录！你是第 {} 个访客。请访问 /status 查看面板。", current_count))
         } else {
